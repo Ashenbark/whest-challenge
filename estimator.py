@@ -18,9 +18,9 @@ import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import MLP, BaseEstimator, SetupContext
 
-# Gauss-Hermite quadrature nodes/weights (16-point).
+# Gauss-Hermite quadrature rules for orders 1–16, keyed by node count.
 # Computed once at import time in plain numpy — zero flopscope FLOPs.
-_GH_T, _GH_W = _np.polynomial.hermite.hermgauss(16)
+_GH_RULES = {k: _np.polynomial.hermite.hermgauss(k) for k in range(1, 17)}
 _SQRT2 = math.sqrt(2.0)
 _SQRT_PI_INV = 1.0 / math.sqrt(math.pi)
 _COV_RESCALE_THRESHOLD = 1e100
@@ -36,6 +36,19 @@ class Estimator(BaseEstimator):
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width = mlp.width
         n = width
+        depth = mlp.depth
+
+        # Adaptive GH node count — CDF+PDF cost ~120 FLOPs/element; use 88% of budget for analytical.
+        # flops_per_gh_node: conservative per-node cost across all layers (all n² elements × 120).
+        flops_linear = int(depth * 3 * n**3)
+        flops_per_gh_node = int(depth * n * n * 120)
+        n_gh = min(16, max(0, (int(0.88 * budget) - flops_linear) // flops_per_gh_node))
+        # Fewer than 12 GH nodes is less accurate than the gain approximation for deep networks;
+        # fall back to gain approx in that case.
+        if n_gh < 12:
+            n_gh = 0
+        # Use a proper n_gh-point GH rule (NOT a slice of the 16-point rule — GH nodes are not nested).
+        gh_t, gh_w = _GH_RULES[n_gh] if n_gh > 0 else ([], [])
 
         # --- Phase 1 & 2: analytical propagation ---
         mu = fnp.zeros(n)
@@ -91,9 +104,9 @@ class Estimator(BaseEstimator):
 
             # Accumulate E[ReLU(z_i) × ReLU(z_j)] over quadrature nodes
             E_bicov = fnp.zeros((n, n))
-            for k_idx in range(16):
-                t_k = float(_GH_T[k_idx])
-                w_k = float(_GH_W[k_idx])
+            for k_idx in range(n_gh):
+                t_k = float(gh_t[k_idx])
+                w_k = float(gh_w[k_idx])
                 z_ik = mu_pre + sigma_pre * (_SQRT2 * t_k)          # (n,)
                 relu_zi = fnp.maximum(z_ik, 0.0)                    # (n,)
                 delta = z_ik - mu_pre                               # (n,)
@@ -106,10 +119,13 @@ class Estimator(BaseEstimator):
                 )                                                    # (n,n)
                 E_bicov = E_bicov + w_k * relu_zi[:, None] * E_relu_ji
 
-            E_bicov = E_bicov * _SQRT_PI_INV                        # (n,n) = E[relu_i*relu_j]
-
-            # Post-ReLU covariance: cov = E[relu_i*relu_j] - μ_i*μ_j
-            cov = E_bicov - fnp.outer(mu, mu)
+            if n_gh > 0:
+                E_bicov = E_bicov * _SQRT_PI_INV                    # (n,n) = E[relu_i*relu_j]
+                cov = E_bicov - fnp.outer(mu, mu)
+            else:
+                # Gain approximation fallback when budget is too small for GH quadrature
+                gain = fnp.where(sigma_pre > 1e-12, Phi_a, 0.0)
+                cov = fnp.multiply(fnp.outer(gain, gain), cov_pre)
             # Fix diagonal to exact marginal variance
             fnp.fill_diagonal(cov, var_post)
 
@@ -118,12 +134,9 @@ class Estimator(BaseEstimator):
         mu_cov = fnp.stack(rows_cov, axis=0)   # (depth, width)
 
         # --- Phase 3: antithetic MC blend ---
-        depth = mlp.depth
-        # Estimate FLOPs used so far (analytical phases).
-        # flopscope counts (m,n)@(n,k) as 2*m*n*k FLOPs (multiply + add separately).
-        # einsum "ij,ia,jb->ab" costs 3n³; GH quadrature ~90n² per node × 16 nodes = 1440n² per layer.
-        flops_analytical = int(depth * (3 * n**3 + 2000 * n**2))  # conservative overestimate
-        # Per additional antithetic half-sample: 2 extra rows in (2*n_half, n) batch = 2 × 2n² × depth
+        # Actual analytical cost: linear + GH quadrature (n_gh nodes used)
+        flops_analytical = flops_linear + n_gh * flops_per_gh_node
+        # Per antithetic half-sample: batch (2, n) @ (n, n) costs 2×2n² per layer
         flops_per_half = int(4 * depth * n * n)
         remaining = int(0.095 * budget) - flops_analytical
         n_half = max(0, remaining // flops_per_half)
