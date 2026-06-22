@@ -8,9 +8,11 @@ Two findings drive this design:
      raise the multiplier proportionally), pinning us at MSE_floor × 0.1. The only
      way down is lower variance PER FLOP — i.e. variance reduction.
 
-Variance reduction (measured, 5 seeds × 16 trials, final-layer variance):
+Variance reduction (measured, 4-5 seeds × 16 trials, final-layer variance):
      plain        1.00x      antithetic   1.05x   (antithetic decays to ~nothing
      whiten       1.88x      anti+whiten  2.10x    by the final layer at depth 32)
+  Stacking attempts: radial stratification 0.99x, Sobol QMC 1.05x, orthogonal
+  blocks 0.60x — none improve meaningfully on anti+whiten.
 
 Whitening forces the input batch's empirical mean to 0 (antithetic) and covariance
 to I (ZCA), removing the dominant low-moment sampling error; the benefit survives
@@ -20,7 +22,8 @@ the 32-layer nonlinear propagation. Cost ≈ 1.7B FLOPs (one eigh + two matmuls)
 Budget math:
   effective_compute = flops_used + 1e11 * residual_wall_time_s
   floor at max(0.1, C/B); target C ≤ 0.099 * B to stay just under the floor
-  residual_wall_time ≈ 0.025-0.030s → ~3B effective FLOPs penalty
+  residual_wall_time measured ≈ 5ms (Python loop + rng + concat overhead);
+  12ms estimate gives 2.4× safety margin → ~1.2B effective FLOPs penalty
 """
 
 from __future__ import annotations
@@ -53,8 +56,8 @@ class Estimator(BaseEstimator):
         # No analytical pass → no analytical FLOPs.
         # residual_wall_time = total_wall - flopscope_backend - flopscope_overhead.
         # Numpy BLAS calls are 'backend' time, not residual. Python loop (32 iter)
-        # overhead + rng + concat + eigh overhead ≈ 25-30ms → use 30ms for margin.
-        wall_penalty_estimate = int(0.030 * _LAMBDA)   # 3.0B (30ms residual estimate)
+        # overhead + rng + concat + eigh overhead measured ≈ 5ms; use 12ms (2.4×).
+        wall_penalty_estimate = int(0.012 * _LAMBDA)   # 1.2B (12ms residual estimate)
         # Whitening adds a fixed eigh (~n³) plus per-sample cost: the covariance
         # x.T@x and the transform x@W each cost n_total*n² = 2*n_half*n².
         # So effective per-half cost = 4*n²*(depth+1); fixed eigh ≈ 6n³.
