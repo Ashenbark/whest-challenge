@@ -1,15 +1,26 @@
-"""Estimator: pure antithetic Monte Carlo.
+"""Estimator: whitened antithetic Monte Carlo.
 
-Theory: analytical (gain-approx) has MSE ≈ 2.4e-4 dominated by bias from the
-Gaussian pre-activation assumption accumulating over 32 layers. MC MSE ≈ 3.2e-6.
-Optimal blend weight α_opt = σ_mc² / (b² + σ_mc²) ≈ 1.3% — negligible benefit.
-Strategy: skip analytical entirely, spend all 9.9% budget on MC samples.
+Two findings drive this design:
+  1. Analytical (Gaussian covariance propagation, even exact-bivariate GH) is
+     capped at MSE ≈ 2e-4 by the joint-Gaussian pre-activation assumption, which
+     fails over 32 layers. Pure MC (MSE ≈ 6-10e-6) is ~30x better — so no blend.
+  2. For pure MC the adjusted score is flat in budget (more samples lower MSE but
+     raise the multiplier proportionally), pinning us at MSE_floor × 0.1. The only
+     way down is lower variance PER FLOP — i.e. variance reduction.
+
+Variance reduction (measured, 5 seeds × 16 trials, final-layer variance):
+     plain        1.00x      antithetic   1.05x   (antithetic decays to ~nothing
+     whiten       1.88x      anti+whiten  2.10x    by the final layer at depth 32)
+
+Whitening forces the input batch's empirical mean to 0 (antithetic) and covariance
+to I (ZCA), removing the dominant low-moment sampling error; the benefit survives
+the 32-layer nonlinear propagation. Cost ≈ 1.7B FLOPs (one eigh + two matmuls),
+~7% of the MC budget — a clear win for a 2x MSE reduction.
 
 Budget math:
   effective_compute = flops_used + 1e11 * residual_wall_time_s
   floor at max(0.1, C/B); target C ≤ 0.099 * B to stay just under the floor
-  residual_wall_time (pure MC, no analytical) ≈ 0.003s → ~300M effective FLOPs
-  n_half ≈ (0.099 * B - 300M) / (4 * depth * n²) ≈ 3170 at B = 2.72e11
+  residual_wall_time ≈ 0.025-0.030s → ~3B effective FLOPs penalty
 """
 
 from __future__ import annotations
@@ -42,23 +53,36 @@ class Estimator(BaseEstimator):
         # No analytical pass → no analytical FLOPs.
         # residual_wall_time = total_wall - flopscope_backend - flopscope_overhead.
         # Numpy BLAS calls are 'backend' time, not residual. Python loop (32 iter)
-        # overhead + rng + concat overhead ≈ 20ms → 2B penalty. Use 25ms for margin.
-        wall_penalty_estimate = int(0.025 * _LAMBDA)   # 2.5B (25ms residual estimate)
-        mc_flop_budget = int(0.099 * budget) - wall_penalty_estimate
-        # Each antithetic half-pair costs 4*depth*n² FLOPs (2 matmuls × 2 passes)
-        flops_per_half = int(4 * depth * n * n)
+        # overhead + rng + concat + eigh overhead ≈ 25-30ms → use 30ms for margin.
+        wall_penalty_estimate = int(0.030 * _LAMBDA)   # 3.0B (30ms residual estimate)
+        # Whitening adds a fixed eigh (~n³) plus per-sample cost: the covariance
+        # x.T@x and the transform x@W each cost n_total*n² = 2*n_half*n².
+        # So effective per-half cost = 4*n²*(depth+1); fixed eigh ≈ 6n³.
+        eigh_fixed = int(6 * n**3)
+        mc_flop_budget = int(0.099 * budget) - wall_penalty_estimate - eigh_fixed
+        flops_per_half = int(4 * n * n * (depth + 1))
         n_half = max(0, mc_flop_budget // flops_per_half)
 
         if n_half == 0:
             # Extreme budget: fall back to gain-approx analytical
             return self._gain_approx(mlp)
 
-        # -- antithetic MC phase --
+        # -- whitened antithetic MC phase --
+        # Antithetic pairing makes the empirical mean exactly 0; whitening then
+        # forces the empirical covariance to exactly I. Fixing the input's first
+        # two moments removes the dominant sampling error and propagates through
+        # the network, giving ~2x lower final-layer variance than plain/antithetic
+        # MC at depth 32 (antithetic alone decays to ~1x by the final layer).
         rng = fnp.random.default_rng(mlp.seed)
         x_half = fnp.array(
             rng.standard_normal((n_half, n)).astype(_np.float32)
         )
-        x = fnp.concatenate([x_half, -x_half], axis=0)
+        x = fnp.concatenate([x_half, -x_half], axis=0)   # mean exactly 0
+        cov = (x.T @ x) / float(x.shape[0])
+        vals, vecs = fnp.linalg.eigh(cov)
+        inv_sqrt = (vecs * (1.0 / fnp.sqrt(fnp.maximum(vals, 1e-12)))) @ vecs.T
+        x = (x @ inv_sqrt).astype(_np.float32)           # cov now exactly I
+
         mc_rows = []
         for w in mlp.weights:
             x = fnp.maximum(x @ w, 0.0)
