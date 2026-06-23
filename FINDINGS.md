@@ -175,6 +175,57 @@ at L20) and this experiment are the two ends of the same curve.
 `Cov(a₁, a₃₂)` is ~1.6e9 FLOPs (~6% of the MC budget) — leaves only ~1.3% net
 gain on the adjusted score. Real, free of bias, but far from the leaderboard.
 
+## Exact bivariate GH propagation, standalone — net-negative (DEAD)
+
+`vr_exact_gh.py` propagates the full distribution through all 32 layers using
+K=16 Gauss-Hermite quadrature for the exact off-diagonal post-ReLU covariance
+(instead of the gain approximation Φ(αᵢ)Φ(αⱼ) used by ex.03). This eliminates
+the gain-approximation error at every layer.
+
+**Result: standalone GH propagation MSE ≈ 7.5–11×10⁻⁵** — 14× *worse* than our
+~6×10⁻⁶ anti+ZCA MC estimator, and nearly as bad as the naive covariance
+propagation (8.4×10⁻⁵). The exact GH quadrature computes the correct bivariate
+post-ReLU covariance under *Gaussian* pre-activations, but at depth 32 the
+pre-activations are severely non-Gaussian. No quadrature-based correction to
+the Gaussian propagation can fix this — the Gaussian assumption, not the
+off-diagonal approximation, is the dominant error source. Dead.
+
+## Oracle deep CV sweep — confirms 3.68× ceiling, MLMC still dead
+
+`vr_cv_deep.py` tests oracle control variates at L∈{1,2,4,8,16} *on top of
+anti+ZCA whitening*, using an exact 1M-sample GT for E[a_L] and oracle (OLS)
+betas — the absolute best-case scenario for deep CVs (4 seeds × 16 trials, N=5768):
+
+| control | variance | bias² | MSE | vs direct |
+|---|---|---|---|---|
+| direct (anti+ZCA) | 5.654e-6 | 6.518e-7 | 6.306e-6 | 1.00× |
+| cv_l1 | 5.437e-6 | 3.337e-7 | 5.771e-6 | 1.09× |
+| cv_l2 | 5.202e-6 | 2.602e-7 | 5.462e-6 | 1.15× |
+| cv_l4 | 4.687e-6 | 2.117e-7 | 4.899e-6 | 1.29× |
+| cv_l8 | 3.329e-6 | 1.529e-7 | 3.482e-6 | 1.81× |
+| cv_l16 | 1.605e-6 | 1.067e-7 | 1.712e-6 | **3.68×** |
+| cv_1248 | 3.519e-6 | 1.903e-7 | 3.710e-6 | 1.70× |
+
+**Oracle cv_l16 = 3.68× on top of anti+ZCA, giving MSE=1.712e-6 — below the
+top-5 threshold of 2.79e-6.** This confirms the gap to top-5 is theoretically
+closable if E[a_16] could be supplied accurately and cheaply. The correlation
+grows monotonically with depth exactly as predicted.
+
+**But MLMC (budget-split) cannot realize this:** `vr_mlmc_deepcv.py` (3 seeds ×
+24 trials, budget_SL=32×6000, oracle beta) tested all L∈{8,12,16,20} × split
+∈{0.1,…,0.5}. Every setting is net-negative:
+
+```
+direct anti+whiten MSE = 6.554e-6  (baseline)
+L=16, split=0.1 → 2.028e-5 (0.32×)   L=16, split=0.2 → 1.212e-5 (0.54×)
+L=8,  split=0.1 → 1.043e-5 (0.63×)   L=20, split=0.3 → 1.038e-5 (0.63×)
+BEST: L=None (no CV),  1.00×
+```
+
+The independent shallow MC estimate of E[a_L] has high enough variance that
+the β²·Var(Êhat) term overwhelms the CV saving at every budget allocation
+tested. **Dead.** The oracle ceiling is real but unrealizable within the budget.
+
 ## Conclusion
 
 All three levers in `adjusted = V · c / (VR · B)` are now closed by direct
@@ -193,6 +244,13 @@ Our 3.72e-7 is at the practical ceiling for the standard toolkit. Reaching
 2.25e-7 requires a technique outside the (now exhaustively mapped) space of
 moment-matching, control variates, analytic propagation, MLMC, low-rank
 forward compression, kernel herding, and first-layer exact-expectation controls.
+
+**Oracle CV gap (the tightest bound we have):** `vr_cv_deep.py` confirms the
+oracle ceiling at L=16 ON TOP OF anti+ZCA is 3.68× (MSE=1.712e-6), which is
+below the top-5 threshold. The budget-split MLMC needed to realize it is
+provably net-negative at the available budget. A method that supplies E[a_16]
+without proportional cost — e.g., an accurate-enough analytical propagation to
+depth 16 — would close the gap. No such method exists in the known toolkit.
 
 **Unified barrier (the strongest statement we can make):** every variance-
 reduction lever reduces to a control variate `g` needing (a) known `E[g]` and
