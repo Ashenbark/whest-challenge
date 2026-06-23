@@ -55,17 +55,31 @@ estimating it from the same samples gives an identically-zero control. Whitening
 works precisely because the degree-2 input expectation (I) is the one rich
 control whose value is known a priori. Nothing else qualifies.
 
+## Last-layer Rao-Blackwell — built and benchmarked, net-negative
+
+`vr_lastlayer_rb.py` implements and grades four variants vs a 2M-sample GT
+(5 seeds, 40 trials, N=5926):
+
+| Method | MSE | vs direct |
+|---|---|---|
+| direct (current) | 5.495e-6 | 1.00× |
+| gauss_rb (biased replacement) | 6.904e-6 | 0.80× |
+| rb_cv (optimal λ≈0.35, unbiased) | 5.999e-6 | 0.92× |
+| rb_debiased_split (unbiased) | 1.976e-5 | 0.28× |
+
+**Theoretical per-neuron variance ceiling: 0.855× — below 1.0×.** Deep ReLU
+pre-activations z_32 carry enough excess kurtosis that the empirical σ̂ is
+*noisier* than the direct ReLU sample-mean, so even the perfectly-unbiased RB
+has higher variance than direct. This lever cannot break even.
+
 ## Conclusion
 
 The leaders' ~1.6× edge is **not** from a control variate, a better analytic, a
-blend, or a FLOP-counting trick — all are ruled out by direct measurement. The
-remaining structurally-possible sources are narrow:
+blend, a last-layer Rao-Blackwell, or a FLOP-counting trick — all ruled out by
+direct measurement. The remaining structurally-possible sources are narrow:
 
-1. A **last-layer Rao-Blackwell** variance cut tuned to be near-unbiased (the
-   naive replacement is biased: 0.81×; no known-expectation control exists to
-   make it unbiased — so this is unlikely to fully explain 1.6×).
-2. A **modestly better base-sampler constant** than ZCA+antithetic.
-3. **Favorable benchmark averaging** — per-MLP MSE varies 2–9e-6; the headline
+1. A **modestly better base-sampler constant** than ZCA+antithetic.
+2. **Favorable benchmark averaging** — per-MLP MSE varies 2–9e-6; the headline
    average may reflect a method only ~1.2–1.3× better than ours.
 
 Our 3.72e-7 is at the practical ceiling for the standard toolkit. Reaching
