@@ -72,6 +72,25 @@ pre-activations z_32 carry enough excess kurtosis that the empirical σ̂ is
 *noisier* than the direct ReLU sample-mean, so even the perfectly-unbiased RB
 has higher variance than direct. This lever cannot break even.
 
+## Base-sampler search + realized improvement
+
+Searched for a better variance-reduction constant; **none beats anti+ZCA**:
+PCA-whiten (0.94×), radial stratification (0.98×), Sobol QMC (0.95×), ZCA-order
+swaps (0.98×), multi-axis antithetic K=2…8 (0.80–0.96×; the apparent double-anti
+1.065× was noise), and active-subspace quadrature (not viable: a_32 is output-rank
+~2–3 but each mode depends on ~55–74 *input* directions). anti+ZCA is the
+moment-cubature ceiling.
+
+Realized change: **fold the ZCA transform into W₁** (`w0 = inv_sqrt @ W₁`) —
+numerically identical output (diff 2e-6), but it removes a full (N×n) matmul,
+trims per-sample cost ~2.8%, and lets us sit **safely at the 0.1 floor** (the old
+estimator ran at 0.10088, slightly *over*). Net ≈1–2% lower adjusted score, with
+a ~12ms wall-time margin so no MLP is pushed over the floor.
+
+**Per-MLP MSE is high-variance** (rank-2 collapse → MSE averages over only ~2–3
+independent mode-errors), so single-MLP grader scores swing ~2× run-to-run; only
+the multi-MLP leaderboard average is meaningful.
+
 ## Conclusion
 
 The leaders' ~1.6× edge is **not** from a control variate, a better analytic, a

@@ -56,14 +56,18 @@ class Estimator(BaseEstimator):
         # No analytical pass → no analytical FLOPs.
         # residual_wall_time = total_wall - flopscope_backend - flopscope_overhead.
         # Numpy BLAS calls are 'backend' time, not residual. Python loop (32 iter)
-        # overhead + rng + concat + eigh overhead measured ≈ 8ms; reserve 10ms.
-        wall_penalty_estimate = int(0.010 * _LAMBDA)   # 1.0B (10ms residual reserve)
+        # overhead + rng + concat + eigh overhead measured ≈ 8.5ms; reserve 11ms
+        # so effective_compute stays ≤ floor even on higher-wall MLPs.
+        wall_penalty_estimate = int(0.011 * _LAMBDA)   # 1.1B (11ms residual reserve)
         # The whitening transform is FOLDED into W₁ (w0' = inv_sqrt @ W₁), so the
         # only per-sample whitening cost is the covariance x.T@x (= 2*n_half*n²).
         # Per-half cost is therefore the forward (depth matmuls, 2*n_half*n² each)
         # plus the covariance: 4*n²*(depth+1). Fixed: eigh ≈ 6n³ + fold ≈ 2n³.
         eigh_fixed = int(8 * n**3)
-        mc_flop_budget = int(0.0999 * budget) - wall_penalty_estimate - eigh_fixed
+        # Target 0.099·B for the MC FLOPs; with the eigh/fold fixed cost and the
+        # 11ms wall reserve this lands profiled flops_used ≈ 0.0955·B, leaving a
+        # ~12ms wall margin so effective_compute stays ≤ the 0.1 floor on every MLP.
+        mc_flop_budget = int(0.099 * budget) - wall_penalty_estimate - eigh_fixed
         flops_per_half = int(4 * n * n * (depth + 1))
         n_half = max(0, mc_flop_budget // flops_per_half)
 
