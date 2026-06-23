@@ -119,6 +119,30 @@ suggest it might be compressible:
   propagation. The forward pass must be computed **exactly** per sample; `c` is
   incompressible. Dead.
 
+## Arc-cosine kernel herding (closed)
+
+`vr_arccosine_herding.py`, 4 seeds × 24 trials, N=6000, N_CAND=10000:
+
+The depth-L arc-cosine kernel (Cho & Saul 2009) is the RKHS kernel of He-init
+ReLU networks — kernel herding with it minimizes the worst-case E[f] error over
+all functions in this RKHS, which includes our target MLP by construction.
+
+**Naive herding** selects deterministically from a fixed pool → var≈0, bias²≈6e-6.
+**Rotated herding** (fresh Haar rotation Q each trial → Q·X_herd) is unbiased by
+rotational invariance of N(0,I), giving real cross-trial variance. Results:
+
+| Method | Variance | Bias² | MSE | vs anti+ZCA |
+|---|---|---|---|---|
+| anti_zca | 5.640e-06 | 2.165e-07 | 5.857e-06 | 1.000× |
+| rherd_anti_zca | 5.446e-06 | 1.577e-06 | 7.023e-06 | **0.834×** |
+
+7× higher bias, negligible variance change → 19% worse. **Dead.**
+
+Root cause: in d=256 the random Haar rotation is statistically identical to a
+fresh Gaussian draw — it destroys the herded set's coverage structure relative
+to the specific MLP's weight matrix. Kernel herding's benefit over random
+sampling requires N >> 2^d to manifest; at N=6000, d=256 it is purely noise.
+
 ## Conclusion
 
 All three levers in `adjusted = V · c / (VR · B)` are now closed by direct
