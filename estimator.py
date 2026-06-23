@@ -56,13 +56,14 @@ class Estimator(BaseEstimator):
         # No analytical pass → no analytical FLOPs.
         # residual_wall_time = total_wall - flopscope_backend - flopscope_overhead.
         # Numpy BLAS calls are 'backend' time, not residual. Python loop (32 iter)
-        # overhead + rng + concat + eigh overhead measured ≈ 5ms; use 12ms (2.4×).
-        wall_penalty_estimate = int(0.012 * _LAMBDA)   # 1.2B (12ms residual estimate)
-        # Whitening adds a fixed eigh (~n³) plus per-sample cost: the covariance
-        # x.T@x and the transform x@W each cost n_total*n² = 2*n_half*n².
-        # So effective per-half cost = 4*n²*(depth+1); fixed eigh ≈ 6n³.
-        eigh_fixed = int(6 * n**3)
-        mc_flop_budget = int(0.099 * budget) - wall_penalty_estimate - eigh_fixed
+        # overhead + rng + concat + eigh overhead measured ≈ 8ms; reserve 10ms.
+        wall_penalty_estimate = int(0.010 * _LAMBDA)   # 1.0B (10ms residual reserve)
+        # The whitening transform is FOLDED into W₁ (w0' = inv_sqrt @ W₁), so the
+        # only per-sample whitening cost is the covariance x.T@x (= 2*n_half*n²).
+        # Per-half cost is therefore the forward (depth matmuls, 2*n_half*n² each)
+        # plus the covariance: 4*n²*(depth+1). Fixed: eigh ≈ 6n³ + fold ≈ 2n³.
+        eigh_fixed = int(8 * n**3)
+        mc_flop_budget = int(0.0999 * budget) - wall_penalty_estimate - eigh_fixed
         flops_per_half = int(4 * n * n * (depth + 1))
         n_half = max(0, mc_flop_budget // flops_per_half)
 
@@ -76,6 +77,9 @@ class Estimator(BaseEstimator):
         # two moments removes the dominant sampling error and propagates through
         # the network, giving ~2x lower final-layer variance than plain/antithetic
         # MC at depth 32 (antithetic alone decays to ~1x by the final layer).
+        # A head-to-head sampler shootout (PCA-whiten, radial stratification, Sobol
+        # QMC, multi-axis antithetic up to 8 axes, active-subspace quadrature) found
+        # none beats anti+ZCA — it is the moment-cubature ceiling (see FINDINGS.md).
         rng = fnp.random.default_rng(mlp.seed)
         x_half = fnp.array(
             rng.standard_normal((n_half, n)).astype(_np.float32)
@@ -84,10 +88,15 @@ class Estimator(BaseEstimator):
         cov = (x.T @ x) / float(x.shape[0])
         vals, vecs = fnp.linalg.eigh(cov)
         inv_sqrt = (vecs * (1.0 / fnp.sqrt(fnp.maximum(vals, 1e-12)))) @ vecs.T
-        x = (x @ inv_sqrt).astype(_np.float32)           # cov now exactly I
 
+        # Fold the ZCA transform into the first weight: (x @ inv_sqrt) @ W₁ =
+        # x @ (inv_sqrt @ W₁). This is bit-for-bit the same first-layer output but
+        # replaces an (N×n)@(n×n) matmul with one (n×n)@(n×n), freeing ~2% budget.
+        w0 = (inv_sqrt @ mlp.weights[0]).astype(_np.float32)
         mc_rows = []
-        for w in mlp.weights:
+        x = fnp.maximum(x @ w0, 0.0)
+        mc_rows.append(fnp.mean(x, axis=0))
+        for w in mlp.weights[1:]:
             x = fnp.maximum(x @ w, 0.0)
             mc_rows.append(fnp.mean(x, axis=0))
         return fnp.stack(mc_rows, axis=0)   # (depth, width)
