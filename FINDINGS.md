@@ -91,16 +91,49 @@ a ~12ms wall-time margin so no MLP is pushed over the floor.
 independent mode-errors), so single-MLP grader scores swing ~2× run-to-run; only
 the multi-MLP leaderboard average is meaningful.
 
+## Cheaper samples — the FLOP-per-sample lever (closed)
+
+At the floor `adjusted = V · c / (VR · B)` where `c` = FLOPs/sample. Every prior
+attack targeted `V` or `VR`; this one targets `c`. The forward pass is `depth`
+dense matmuls (`2·N·n²` each) — the entire dominant cost. Two structural facts
+suggest it might be compressible:
+
+- **Homogeneity (bias-free network).** With no biases the network is exactly
+  degree-1 positively homogeneous, so `E[f(x)] = E‖x‖ · E_u[f(u)]` with `E‖x‖`
+  known in closed form. But in n=256 the radius is razor-concentrated
+  (`Var‖x‖ ≈ 0.5` vs `E‖x‖² = 256`), and ZCA already pins the batch mean-square
+  radius to `n` exactly — so the radial decomposition buys **<0.2%**. Dead.
+
+- **Deep rank collapse.** The *raw* activation batch `a_L` collapses to effective
+  rank ~1 by L8 (mean-dominated); the *centered* fluctuation is rank ~8 at L16,
+  ~3 at L32 (`rank_depth.py`). So `a_L ≈ μ·1ᵀ + (rank-R)`, and `a_L @ W` could be
+  factored at `~N·R·n` instead of `N·n²` — with a randomized rank-R re-SVD per
+  deep layer this nets **~1.7× cheaper forward**, right at the gap size.
+
+  **But the truncation bias is catastrophic** (`lowrank_bias.py`, 3 seeds): even
+  the gentlest setting (switch at L16, keep R=32 modes) injects **bias² ≈ 2e-4**
+  into the final mean — **~100× the entire target MSE**. Dropping a low-variance
+  mode flips ReLU gates, and the error compounds over the remaining deep layers.
+  The network is too sensitive to tolerate *any* approximation of intermediate
+  activations — the same expansive deep-ReLU chaos that defeats analytic
+  propagation. The forward pass must be computed **exactly** per sample; `c` is
+  incompressible. Dead.
+
 ## Conclusion
 
-The leaders' ~1.6× edge is **not** from a control variate, a better analytic, a
-blend, a last-layer Rao-Blackwell, or a FLOP-counting trick — all ruled out by
-direct measurement. The remaining structurally-possible sources are narrow:
+All three levers in `adjusted = V · c / (VR · B)` are now closed by direct
+measurement: the leaders' ~1.6× edge is **not** from a control variate, a better
+analytic, a blend, a last-layer Rao-Blackwell, a FLOP-counting trick, a richer
+base-sampler, the homogeneity/radial decomposition, **nor cheaper (low-rank)
+samples** — the deep ReLU dynamics forbid any per-sample approximation. The
+remaining structurally-possible sources are narrow:
 
-1. A **modestly better base-sampler constant** than ZCA+antithetic.
+1. A **modestly better base-sampler constant** than ZCA+antithetic (we beat every
+   variant we tried, but the search is not provably exhaustive).
 2. **Favorable benchmark averaging** — per-MLP MSE varies 2–9e-6; the headline
    average may reflect a method only ~1.2–1.3× better than ours.
 
 Our 3.72e-7 is at the practical ceiling for the standard toolkit. Reaching
 2.25e-7 requires a technique outside the (now exhaustively mapped) space of
-moment-matching, control variates, analytic propagation, and MLMC.
+moment-matching, control variates, analytic propagation, MLMC, and low-rank
+forward compression.
